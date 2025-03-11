@@ -589,9 +589,9 @@ def solve_pin_assignment(
         cost_var
         == (
             total_port_usage
-            + total_bbox_spread
-            + total_max_dist
-            + total_overlap_area  # [NEW]
+            + total_bbox_spread * 2
+            + total_max_dist * 2
+            + total_overlap_area * 5  # [NEW]
         )
     )
     model.Minimize(cost_var)
@@ -810,8 +810,8 @@ def main():
         "usbfs": 1,
         "sdmmc": 1,
         "swd": 1,
-        "fdcan": 1,
-        "uart": 4,
+        "fdcan": 2,
+        "uart": 6,
         "spi": 2,
         "tim": 4,
         "i2c": 3,
