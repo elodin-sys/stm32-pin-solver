@@ -108,8 +108,7 @@ def parse_stm32_pins(xml_path):
     tree = ET.parse(xml_path)
     root = tree.getroot()
 
-    # If your XML has a namespace, adapt this accordingly
-    namespace = "{http://dummy.com}"
+    namespace = "{http://dummy.com}"  # Adjust if your file truly uses a namespace
     valid_pin_types = {"I/O", "MonoIO"}
 
     pin_functions = {}
@@ -141,7 +140,7 @@ def parse_stm32_pins(xml_path):
 
 
 ###############################################################################
-# 2) THE OR-TOOLS CP-SAT SOLVER WITH 3 COST TERMS (equally weighted)
+# 2) THE OR-TOOLS CP-SAT SOLVER WITH 4 COST TERMS (equally weighted)
 ###############################################################################
 
 
@@ -154,22 +153,18 @@ def solve_pin_assignment(
     max_time_s=60.0,
 ):
     """
-    We'll use 3 cost terms with equal weights (1,1,1):
+    We'll use 4 cost terms, all with weight=1:
       1) # of distinct ports used
       2) bounding-box spread
       3) max pairwise distance
-    Returns a structured dictionary with the solution info.
+      4) sum of bounding-box overlap areas among used instances
+
+    final cost = (#ports) + (bboxSpread) + (maxDist) + (overlapArea).
     """
 
-    # We'll keep them all = 1
-    weights = {"ports": 1, "bbox": 1, "maxd": 1}
-
-    #######################################################################
-    # The model building is unchanged from the prior example:
-    #######################################################################
     model = cp_model.CpModel()
 
-    # 1) define signals
+    # 1) define signals for each p_type
     peripheral_signals = {
         "i2c": ["scl", "sda"],
         "uart": ["tx", "rx"],
@@ -213,7 +208,7 @@ def solve_pin_assignment(
                 return p_type, full_name[len(p_type) :]
         return None, None
 
-    # 2) Identify all (p_type, instance)
+    # 2) identify all (p_type, instance)
     available_peripherals = {pt: set() for pt in peripheral_signals}
     for pin_idx, funcs in pin_functions.items():
         for fullname, sig in funcs:
@@ -231,14 +226,13 @@ def solve_pin_assignment(
         inst_list = []
         for suffix in sorted(available_peripherals[p_type]):
             name = p_type + suffix
-            # must have all signals
             if all(
                 any((name, s) in pin_functions[p] for p in pin_functions) for s in sigs
             ):
                 inst_list.append(suffix)
         complete_peripherals[p_type] = inst_list
 
-    # 4) check feasibility
+    # 4) feasibility check
     for p_type, needed_count in peripheral_requirements.items():
         if p_type not in complete_peripherals:
             print(f"[ERROR] {p_type} not recognized.")
@@ -248,7 +242,7 @@ def solve_pin_assignment(
             print(f"[ERROR] Not enough {p_type}. Need {needed_count}, found {have}.")
             return None
 
-    # 5) create used bools
+    # 5) create "used" bool
     peripheral_vars = {}
     for p_type, inst_list in complete_peripherals.items():
         needed_count = peripheral_requirements.get(p_type, 0)
@@ -264,7 +258,7 @@ def solve_pin_assignment(
                 sum(peripheral_vars[p_type][inst] for inst in inst_list) == needed_count
             )
 
-    # 6) for each (instance, signal) => IntVar
+    # 6) for each (instance, signal) => pin or -1
     pin_vars = {}
 
     def valid_pins_for(fn, sig):
@@ -283,7 +277,7 @@ def solve_pin_assignment(
                 model.Add(xv != -1).OnlyEnforceIf(ubv)
                 model.Add(xv == -1).OnlyEnforceIf(ubv.Not())
 
-    # 7) at most one signal per pin
+    # 7) "at most one signal per pin"
     assigned_bvar = {}
     for (fn, sig), xv in pin_vars.items():
         for pin_idx in pin_functions:
@@ -293,12 +287,12 @@ def solve_pin_assignment(
             model.Add(xv != pin_idx).OnlyEnforceIf(b.Not())
 
     for pin_idx in pin_functions:
-        all_b = []
+        these_b = []
         for fn, sig in pin_vars:
-            all_b.append(assigned_bvar[(fn, sig, pin_idx)])
-        model.AddAtMostOne(all_b)
+            these_b.append(assigned_bvar[(fn, sig, pin_idx)])
+        model.AddAtMostOne(these_b)
 
-    # 8) cost #1 => ports
+    # 8) cost #1 => #ports
     def extract_port(pn):
         m = re.match(r"^P([A-Z])\d+", pn)
         return m.group(1) if m else "?"
@@ -400,6 +394,14 @@ def solve_pin_assignment(
         )
 
     instance_bbox_spread = {}
+    # [NEW OVERLAP LOGIC START]
+    # We'll store rMin, rMaxPlus1, cMin, cMaxPlus1 for later overlap computations.
+    instance_rMin = {}
+    instance_rMaxPlus1 = {}
+    instance_cMin = {}
+    instance_cMaxPlus1 = {}
+    # [NEW OVERLAP LOGIC END]
+
     for p_type, inst_map in peripheral_vars.items():
         for inst, ubv in inst_map.items():
             fn = p_type + inst
@@ -424,6 +426,17 @@ def solve_pin_assignment(
             instance_bbox_spread[(p_type, inst)] = final_spr
             model.Add(final_spr == spr).OnlyEnforceIf(ubv)
             model.Add(final_spr == 0).OnlyEnforceIf(ubv.Not())
+
+            # [NEW OVERLAP LOGIC START] - define rMaxPlus1, cMaxPlus1
+            rMaxP1 = model.NewIntVar(0, 501, f"{fn}_rMaxPlus1")
+            cMaxP1 = model.NewIntVar(0, 501, f"{fn}_cMaxPlus1")
+            model.Add(rMaxP1 == rMax + 1)
+            model.Add(cMaxP1 == cMax + 1)
+            instance_rMin[(p_type, inst)] = rMin
+            instance_rMaxPlus1[(p_type, inst)] = rMaxP1
+            instance_cMin[(p_type, inst)] = cMin
+            instance_cMaxPlus1[(p_type, inst)] = cMaxP1
+            # [NEW OVERLAP LOGIC END]
 
     total_bbox_spread = model.NewIntVar(0, 999999, "bbox_spread")
     model.Add(
@@ -463,12 +476,127 @@ def solve_pin_assignment(
     total_max_dist = model.NewIntVar(0, 999999, "max_dist_sum")
     model.Add(total_max_dist == sum(instance_max_dist[k] for k in instance_max_dist))
 
-    # 11) final cost = #ports + bboxSpread + maxDist
+    # [NEW OVERLAP LOGIC START]
+    # 11) cost #4 => bounding-box overlap area
+    instance_list = []
+    used_bool = {}
+    for p_type, inst_map in peripheral_vars.items():
+        for inst, ubv in inst_map.items():
+            instance_list.append((p_type, inst))
+            used_bool[(p_type, inst)] = ubv
+
+    overlap_terms = []
+    for i in range(len(instance_list)):
+        for j in range(i + 1, len(instance_list)):
+            i_type, i_inst = instance_list[i]
+            j_type, j_inst = instance_list[j]
+            i_used = used_bool[(i_type, i_inst)]
+            j_used = used_bool[(j_type, j_inst)]
+
+            # bothUsed = i_used AND j_used
+            bothUsed = model.NewBoolVar(f"bothUsed_{i_type}{i_inst}_{j_type}{j_inst}")
+            # i_used=1 and j_used=1 => bothUsed=1
+            # We'll do a standard linear "AND" trick:
+            # bothUsed <= i_used, bothUsed <= j_used
+            model.Add(bothUsed <= i_used)
+            model.Add(bothUsed <= j_used)
+            # bothUsed >= i_used + j_used - 1
+            model.Add(bothUsed >= i_used + j_used - 1)
+
+            # define the overlap rectangle
+            i_rMin = instance_rMin[(i_type, i_inst)]
+            i_rMaxP1 = instance_rMaxPlus1[(i_type, i_inst)]
+            j_rMin = instance_rMin[(j_type, j_inst)]
+            j_rMaxP1 = instance_rMaxPlus1[(j_type, j_inst)]
+
+            i_cMin = instance_cMin[(i_type, i_inst)]
+            i_cMaxP1 = instance_cMaxPlus1[(i_type, i_inst)]
+            j_cMin = instance_cMin[(j_type, j_inst)]
+            j_cMaxP1 = instance_cMaxPlus1[(j_type, j_inst)]
+
+            # overlapRowMin = max(rMin_i, rMin_j)
+            overlapRowMin = model.NewIntVar(
+                0, 501, f"rowMin_{i_type}{i_inst}_{j_type}{j_inst}"
+            )
+            model.AddMaxEquality(overlapRowMin, [i_rMin, j_rMin])
+
+            # overlapRowMax = min(rMaxP1_i, rMaxP1_j)
+            overlapRowMax = model.NewIntVar(
+                0, 501, f"rowMax_{i_type}{i_inst}_{j_type}{j_inst}"
+            )
+            model.AddMinEquality(overlapRowMax, [i_rMaxP1, j_rMaxP1])
+
+            # overlapColMin = max(cMin_i, cMin_j)
+            overlapColMin = model.NewIntVar(
+                0, 501, f"colMin_{i_type}{i_inst}_{j_type}{j_inst}"
+            )
+            model.AddMaxEquality(overlapColMin, [i_cMin, j_cMin])
+
+            # overlapColMax = min(cMaxP1_i, cMaxP1_j)
+            overlapColMax = model.NewIntVar(
+                0, 501, f"colMax_{i_type}{i_inst}_{j_type}{j_inst}"
+            )
+            model.AddMinEquality(overlapColMax, [i_cMaxP1, j_cMaxP1])
+
+            # overlapHeightCandidate = overlapRowMax - overlapRowMin
+            overlapHeightCandidate = model.NewIntVar(
+                -500, 501, f"overlapHcand_{i_type}{i_inst}_{j_type}{j_inst}"
+            )
+            model.Add(overlapHeightCandidate == overlapRowMax - overlapRowMin)
+
+            overlapHeight = model.NewIntVar(
+                0, 501, f"overlapH_{i_type}{i_inst}_{j_type}{j_inst}"
+            )
+            model.Add(overlapHeight >= overlapHeightCandidate)
+            model.Add(overlapHeight >= 0)
+
+            # overlapWidthCandidate = overlapColMax - overlapColMin
+            overlapWidthCandidate = model.NewIntVar(
+                -500, 501, f"overlapWcand_{i_type}{i_inst}_{j_type}{j_inst}"
+            )
+            model.Add(overlapWidthCandidate == overlapColMax - overlapColMin)
+
+            overlapWidth = model.NewIntVar(
+                0, 501, f"overlapW_{i_type}{i_inst}_{j_type}{j_inst}"
+            )
+            model.Add(overlapWidth >= overlapWidthCandidate)
+            model.Add(overlapWidth >= 0)
+
+            # overlapAreaCandidate = overlapHeight * overlapWidth
+            overlapAreaCandidate = model.NewIntVar(
+                0, 501 * 501, f"overlapArea_{i_type}{i_inst}_{j_type}{j_inst}"
+            )
+            model.AddMultiplicationEquality(
+                overlapAreaCandidate, [overlapHeight, overlapWidth]
+            )
+
+            # finalOverlap = overlapAreaCandidate if bothUsed=1 else 0
+            finalOverlap = model.NewIntVar(
+                0, 501 * 501, f"finalOverlap_{i_type}{i_inst}_{j_type}{j_inst}"
+            )
+            model.Add(finalOverlap == overlapAreaCandidate).OnlyEnforceIf(bothUsed)
+            model.Add(finalOverlap == 0).OnlyEnforceIf(bothUsed.Not())
+
+            overlap_terms.append(finalOverlap)
+
+    total_overlap_area = model.NewIntVar(0, 501 * 501 * 100, "totalOverlapArea")
+    model.Add(total_overlap_area == sum(overlap_terms))
+    # [NEW OVERLAP LOGIC END]
+
+    # 12) final cost => #ports + bboxSpread + maxDist + overlapArea
     cost_var = model.NewIntVar(0, 9999999, "total_cost")
-    model.Add(cost_var == total_port_usage + total_bbox_spread + total_max_dist)
+    model.Add(
+        cost_var
+        == (
+            total_port_usage
+            + total_bbox_spread
+            + total_max_dist
+            + total_overlap_area  # [NEW]
+        )
+    )
     model.Minimize(cost_var)
 
-    # 12) Solve
+    # 13) Solve
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = max_time_s
     status = solver.Solve(model)
@@ -485,8 +613,10 @@ def solve_pin_assignment(
         "ports_used": solver.Value(total_port_usage),
         "bbox_spread": solver.Value(total_bbox_spread),
         "max_dist_sum": solver.Value(total_max_dist),
+        "overlap_area": solver.Value(total_overlap_area),  # [NEW]
         "instances": {},
     }
+
     # gather instance data
     for p_type, inst_map in peripheral_vars.items():
         for inst, ubv in inst_map.items():
@@ -527,19 +657,14 @@ def solve_pin_assignment(
 
 def visualize_bga(solution_data, pin_names, pin_positions):
     """
-    Plot a BGA grid:
-      - Each instance gets a unique color
-      - All pins for that instance are that color
-      - The bounding box is drawn translucent in the same color
-      - For zero-width or zero-height boxes, we artificially enlarge them for visibility
-      - If multiple boxes overlap exactly, we can apply a small offset or different lines
+    Identical to your existing visualize code. We just optionally display
+    'overlap_area' from solution_data in the title or so.
     """
 
     if not solution_data or "instances" not in solution_data:
         print("No solution to visualize.")
         return
 
-    # We'll parse row/col from each pin
     bga_rows = {
         "A": 0,
         "B": 1,
@@ -568,40 +693,26 @@ def visualize_bga(solution_data, pin_names, pin_positions):
         cc = int(m.group(2))
         return (rr, cc)
 
-    fig = plt.figure(figsize=(10, 10))
-    # set size of the plot
+    fig = plt.figure(figsize=(8, 8))
     ax = fig.add_subplot(111, aspect="equal")
 
-    # We'll cycle colors so each instance has a distinct color
-    color_cycle = plt.cm.get_cmap("tab10")  # or any other colormap
+    color_cycle = plt.cm.get_cmap("tab10")
     instance_list = list(solution_data["instances"].keys())
 
-    # We can also do a small offset for each bounding box if needed:
-    # e.g. offset_index = 0,1,2,...  => offset = offset_index * 0.2, etc.
-    # That helps if bounding boxes align exactly.
-    # We'll store the offset in a dictionary below if we want to apply it.
-
     inst_colors = {}
-    inst_offsets = {}
-
     for i, inst_name in enumerate(instance_list):
-        color = color_cycle(i % 10)  # repeat if >10
+        color = color_cycle(i % 10)
         inst_colors[inst_name] = color
-        inst_offsets[inst_name] = i * 0.0  # set to 0 if you don't want a shift
 
-    # We'll gather all pin coords
     all_rows, all_cols = [], []
-
-    # We'll also need bounding box corners
     bounding_boxes = {}
 
-    for i, inst_name in enumerate(instance_list):
+    for inst_name in instance_list:
         inst_data = solution_data["instances"][inst_name]
         assigned_pins = inst_data["pin_assignments"]
         if not assigned_pins:
             continue
 
-        # gather row/col
         rows = []
         cols = []
         for sig, info in assigned_pins.items():
@@ -616,27 +727,17 @@ def visualize_bga(solution_data, pin_names, pin_positions):
         else:
             rMin, rMax, cMin, cMax = 0, 0, 0, 0
 
-        # if width=0 or height=0 => enlarge a bit
         width = max(0, (cMax - cMin))
         height = max(0, (rMax - rMin))
+        bounding_boxes[inst_name] = (cMin, rMin, width, height)
 
-        # optionally shift them by a small offset if you want to avoid perfect overlap
-        shift = inst_offsets[inst_name]
-        bounding_boxes[inst_name] = (
-            cMin - shift,
-            rMin - shift,  # x,y for rectangle
-            width,
-            height,
-        )
-
-        # keep track for scatter points
         for sig, info in assigned_pins.items():
             pos = info["position"]
             (rr, cc) = parse_bga_position(pos)
             all_rows.append(rr)
             all_cols.append(cc)
 
-    # Now let's actually draw
+    # Plot
     for inst_name in instance_list:
         color = inst_colors[inst_name]
         inst_data = solution_data["instances"][inst_name]
@@ -644,7 +745,7 @@ def visualize_bga(solution_data, pin_names, pin_positions):
         if not assigned_pins:
             continue
 
-        # scatter each pin
+        # scatter pins
         for sig, info in assigned_pins.items():
             pos = info["position"]
             (rr, cc) = parse_bga_position(pos)
@@ -653,19 +754,17 @@ def visualize_bga(solution_data, pin_names, pin_positions):
 
         # bounding box
         (x0, y0, w, h) = bounding_boxes[inst_name]
-        # We'll do a translucent fill
         rect = Rectangle(
             (x0, y0),
             w,
             h,
             fill=True,
-            alpha=0.2,  # translucent
+            alpha=0.2,
             edgecolor=color,
             facecolor=color,
             linewidth=1.5,
         )
         ax.add_patch(rect)
-        # Also optionally draw an outline that’s less translucent:
         rect2 = Rectangle(
             (x0, y0), w, h, fill=False, alpha=0.8, edgecolor=color, linewidth=1.0
         )
@@ -678,10 +777,12 @@ def visualize_bga(solution_data, pin_names, pin_positions):
         ax.set_xlim(-1, 10)
         ax.set_ylim(-1, 10)
 
-    ax.invert_yaxis()  # so row=0 is near top if you prefer
+    ax.invert_yaxis()
     ax.set_xlabel("BGA Column")
     ax.set_ylabel("BGA Row")
-    ax.set_title("BGA Pin Assignments")
+    # Show overlap area in title, if you like:
+    overlap_val = solution_data.get("overlap_area", 0)
+    ax.set_title(f"BGA Pin Assignments (overlapArea={overlap_val})")
 
     bga_row_letters = list(bga_rows.keys())
     ax.set_yticks(range(17), labels=bga_row_letters)
@@ -696,7 +797,6 @@ def visualize_bga(solution_data, pin_names, pin_positions):
 
 
 def main():
-    # Example usage
     xml_path = "pin_data/STM32H747XIHx.xml"
     pin_funcs, pin_names, pin_positions = parse_stm32_pins(xml_path)
 
@@ -705,7 +805,6 @@ def main():
         if sigs:
             print(f"  Pin {pin_names[idx]} ({pin_positions[idx]}): {sigs}")
 
-    # Example requirements
     reqs = {
         "eth": 1,
         "usbfs": 1,
@@ -718,13 +817,17 @@ def main():
         "i2c": 3,
     }
 
-    # Solve with each cost factor = 1
-    solution_data = solve_pin_assignment(reqs, pin_funcs, pin_names, pin_positions)
+    solution_data = solve_pin_assignment(
+        reqs,
+        pin_funcs,
+        pin_names,
+        pin_positions,
+        solution_limit=50,
+        max_time_s=60.0,
+    )
     if solution_data:
         print("\nSolution found!\n")
-        # Print structured data
         print(json.dumps(solution_data, indent=2))
-        # Visualize
         visualize_bga(solution_data, pin_names, pin_positions)
 
 
